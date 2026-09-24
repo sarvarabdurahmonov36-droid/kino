@@ -27,6 +27,19 @@ from database import (
 
 load_dotenv()
 
+# ======================== safe_task ========================
+def safe_task(coro):
+    """Background tasklarni xavfsiz ishga tushirish va xatolarni log qilish"""
+    task = asyncio.create_task(coro)
+    def _log_exc(t):
+        try:
+            t.result()
+        except Exception as e:
+            print(f"❌ Background task xatosi: {e}")
+    task.add_done_callback(_log_exc)
+    return task
+
+
 # ======================== Doimiy majburiy obuna ========================
 PERMANENT_MANDATORY_SUBS = [
     {
@@ -325,7 +338,7 @@ async def start_after_subs(update: Update, context: CallbackContext):
         f"Admin: /admin\n\n"
         f"🔗 /referral - referal havolangiz va statistikangiz"
     )
-    asyncio.create_task(send_ad(context.bot, user_id))
+    safe_task(send_ad(context.bot, user_id))
 
 
 # ======================== Start ========================
@@ -348,7 +361,6 @@ async def referral(update: Update, context: CallbackContext):
     if await check_and_handle_mandatory_subs(update, context):
         return
     
-    # Foydalanuvchi qancha odam qo'shgan
     count = await get_user_referral_count(user_id)
     
     refer_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
@@ -474,7 +486,7 @@ async def broadcast_send(update: Update, context: CallbackContext):
     user_ids = await get_all_user_ids()
     total = len(user_ids)
     progress_msg = await msg.reply_text(f"📤 {total} ta foydalanuvchiga jo'natish boshlandi...")
-    asyncio.create_task(_broadcast_task(msg, progress_msg, user_ids, total))
+    safe_task(_broadcast_task(msg, progress_msg, user_ids, total))
     return ConversationHandler.END
 
 
@@ -488,7 +500,10 @@ async def _broadcast_task(msg, progress_msg, user_ids, total):
                 pass
     tasks = [asyncio.create_task(send_to_user(uid)) for uid in user_ids]
     await asyncio.gather(*tasks)
-    await progress_msg.edit_text(f"✅ Xabar {total} ta foydalanuvchiga yuborildi.")
+    try:
+        await progress_msg.edit_text(f"✅ Xabar {total} ta foydalanuvchiga yuborildi.")
+    except:
+        pass
 
 
 # ======================== Video qo'shish ========================
@@ -729,7 +744,6 @@ async def remove_mandatory(update: Update, context: CallbackContext):
         return
     sub_id = int(context.args[0])
     
-    # Doimiy majburiy obunani o'chirishni taqiqlash
     permanent_identifiers = [s["identifier"] for s in PERMANENT_MANDATORY_SUBS]
     rows = await list_mandatory_subscriptions()
     for r in rows:
@@ -796,7 +810,7 @@ async def handle_code(update: Update, context: CallbackContext):
             f"📣 Kino kanal: @kinomario_kino {CHANNEL_USERNAME}"
         )
         await update.message.reply_text(links_msg)
-        await send_ad(context.bot, user_id)
+        safe_task(send_ad(context.bot, user_id))
     else:
         await update.message.reply_text(f"❌ {text} kodli video topilmadi.")
 
@@ -810,7 +824,16 @@ async def webhook_handler(request: Request):
 
 
 async def healthcheck(request: Request):
-    return JSONResponse({"status": "ok"})
+    """Render + UptimeRobot uchun health check"""
+    try:
+        bot_username = bot_application.bot.username if bot_application else None
+    except Exception:
+        bot_username = None
+    return JSONResponse({
+        "status": "ok",
+        "bot": bot_username,
+        "time": time.time()
+    })
 
 
 bot_application = None
@@ -906,12 +929,55 @@ async def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, handle_code)
     )
 
-    await bot_application.initialize()
-    await bot_application.bot.set_webhook(WEBHOOK_URL)
+    # ======================== Retry bilan initialize ========================
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🔄 Initialize urinish {attempt}/{max_retries}...")
+            await bot_application.initialize()
+            print("✅ Initialize muvaffaqiyatli")
+            break
+        except Exception as e:
+            print(f"⚠️ Initialize xatosi ({attempt}/{max_retries}): {e}")
+            if attempt == max_retries:
+                print("❌ Barcha urinishlar muvaffaqiyatsiz. Chiqilmoqda.")
+                raise
+            wait = min(5 * attempt, 30)
+            print(f"⏳ {wait} soniyadan keyin qayta urinish...")
+            await asyncio.sleep(wait)
+
+    # ======================== Retry bilan webhook o'rnatish ========================
+    for attempt in range(1, 6):
+        try:
+            await bot_application.bot.set_webhook(
+                url=WEBHOOK_URL,
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"]
+            )
+            print("✅ Webhook o'rnatildi")
+            break
+        except Exception as e:
+            print(f"⚠️ Webhook o'rnatishda xato ({attempt}/5): {e}")
+            if attempt == 5:
+                raise
+            await asyncio.sleep(5)
+
+    # Webhook holatini tekshirish
+    try:
+        info = await bot_application.bot.get_webhook_info()
+        print(f"📡 Webhook URL: {info.url}")
+        print(f"📡 Pending updates: {info.pending_update_count}")
+        if info.last_error_message:
+            print(f"⚠️ Oxirgi xato: {info.last_error_message}")
+        else:
+            print("✅ Webhook xatosiz ishlayapti")
+    except Exception as e:
+        print(f"⚠️ Webhook info olishda xatolik: {e}")
 
     starlette_app = Starlette(debug=False, routes=[
         Route(WEBHOOK_PATH, webhook_handler, methods=["POST"]),
         Route("/healthcheck", healthcheck, methods=["GET"]),
+        Route("/", healthcheck, methods=["GET"]),
     ])
 
     port = int(os.environ.get("PORT", 8080))
